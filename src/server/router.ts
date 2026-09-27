@@ -4,6 +4,9 @@ import { AccessToken, RoomServiceClient } from "livekit-server-sdk";
 import { randomUUID } from "node:crypto";
 import { voiceAccess } from "../../agent/provider-access";
 
+import { runCodeIsolated } from "@/lib/runner";
+import { runRequestSchema } from "@/lib/protocol";
+
 const t = initTRPC.create();
 export const appRouter = t.router({
   join: t.procedure.mutation(async () => {
@@ -32,5 +35,9 @@ export const appRouter = t.router({
     token.addGrant({ roomJoin: true, room: roomName, canPublish: true, canSubscribe: true, canPublishData: true });
     return { token: await token.toJwt(), wsURL, identity, roomName, mode: mode as "mock" | "voice" };
   }),
+  runCode: t.procedure.input(runRequestSchema).mutation(async ({ input }) => {
+    return await runCodeIsolated(input.documentId, input.revision, input.code);
+  }),
 });
 export type AppRouter = typeof appRouter;
+

@@ -1,2 +1,9 @@
-import Workspace from "@/components/Workspace";
-export default function Page() { return <Workspace />; }
+"use client";
+import dynamic from "next/dynamic";
+
+const Workspace = dynamic(() => import("@/components/Workspace"), { ssr: false });
+
+export default function Page() {
+  return <Workspace />;
+}
+

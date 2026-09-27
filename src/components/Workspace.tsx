@@ -3,14 +3,20 @@ import { useEffect, useRef, useState } from "react";
 import { Room, RoomEvent, ParticipantKind, Track, type Participant } from "livekit-client";
 import { createTRPCClient, httpBatchLink } from "@trpc/client";
 import type { AppRouter } from "@/server/router";
-import { EVENT_TOPIC, SNAPSHOT_RPC, TURN_RPC, QUESTION, STARTER_CODE, eventSchema, snapshotSchema, type EditorSnapshot, type AgentEvent } from "@/lib/protocol";
-import Editor from "./Editor";
+import {
+  EVENT_TOPIC, SNAPSHOT_RPC, TURN_RPC, HIGHLIGHT_RPC, EDIT_RPC, RUN_RPC,
+  QUESTION, STARTER_CODE, eventSchema, snapshotSchema, highlightSchema,
+  editRequestSchema, editResponseSchema, runRequestSchema, runResponseSchema,
+  type EditorSnapshot, type AgentEvent, type RunResponse
+} from "@/lib/protocol";
+import Editor, { type EditorHandle } from "./Editor";
 
 const api = createTRPCClient<AppRouter>({ links: [httpBatchLink({ url: "/api/trpc" })] });
 
 export default function Workspace() {
   const roomRef = useRef<Room | null>(null);
   const audioHost = useRef<HTMLDivElement>(null);
+  const editorRef = useRef<EditorHandle>(null);
   const documentRef = useRef({ documentId: "", revision: 0, code: STARTER_CODE });
   const generation = useRef(0);
   const [revision, setRevision] = useState(0);
@@ -24,6 +30,7 @@ export default function Workspace() {
   const [error, setError] = useState("");
   const [events, setEvents] = useState<AgentEvent[]>([]);
   const [snapshot, setSnapshot] = useState<EditorSnapshot | null>(null);
+  const [lastRun, setLastRun] = useState<RunResponse | null>(null);
 
   useEffect(() => () => { generation.current++; void roomRef.current?.disconnect(); }, []);
 
@@ -35,7 +42,7 @@ export default function Workspace() {
   async function connect() {
     if (roomRef.current || busy) return;
     const current = ++generation.current;
-    setBusy(true); setError(""); setStatus("Connecting"); setSnapshot(null); setEvents([]);
+    setBusy(true); setError(""); setStatus("Connecting"); setSnapshot(null); setEvents([]); setLastRun(null);
     const room = new Room();
     roomRef.current = room;
     const active = () => generation.current === current && roomRef.current === room;
@@ -43,18 +50,61 @@ export default function Workspace() {
       const connection = await api.join.mutate();
       if (!active()) { await room.disconnect(); return; }
       setMode(connection.mode);
+
       room.localParticipant.registerRpcMethod(SNAPSHOT_RPC, async data => {
         const caller = room.remoteParticipants.get(data.callerIdentity);
         if (!active() || caller?.kind !== ParticipantKind.AGENT) throw new Error("Only this room's agent can request editor context.");
         documentRef.current.documentId ||= crypto.randomUUID();
         return JSON.stringify(snapshotSchema.parse({ ...documentRef.current, language: "typescript", capturedAt: Date.now() }));
       });
+
+      room.localParticipant.registerRpcMethod(HIGHLIGHT_RPC, async data => {
+        const caller = room.remoteParticipants.get(data.callerIdentity);
+        if (!active() || caller?.kind !== ParticipantKind.AGENT) throw new Error("Only agent can highlight code.");
+        const req = highlightSchema.parse(JSON.parse(data.payload));
+        editorRef.current?.highlightRange(req.lineStart, req.lineEnd, req.snippet, req.clear);
+        return "highlighted";
+      });
+
+      room.localParticipant.registerRpcMethod(EDIT_RPC, async data => {
+        const caller = room.remoteParticipants.get(data.callerIdentity);
+        if (!active() || caller?.kind !== ParticipantKind.AGENT) throw new Error("Only agent can edit code.");
+        const req = editRequestSchema.parse(JSON.parse(data.payload));
+        const res = editorRef.current?.applyEdit(req, documentRef.current.revision) || {
+          success: false, revision: documentRef.current.revision, code: documentRef.current.code, error: "Editor handle not ready."
+        };
+        if (res.success) {
+          documentRef.current = { documentId: req.documentId, revision: res.revision, code: res.code };
+          setRevision(res.revision);
+        }
+        return JSON.stringify(editResponseSchema.parse(res));
+      });
+
+      room.localParticipant.registerRpcMethod(RUN_RPC, async data => {
+        const caller = room.remoteParticipants.get(data.callerIdentity);
+        if (!active() || caller?.kind !== ParticipantKind.AGENT) throw new Error("Only agent can run code.");
+        const req = runRequestSchema.parse(JSON.parse(data.payload));
+
+        setLastRun({
+          success: false,
+          revision: req.revision,
+          status: "error",
+          output: "Running isolated execution...",
+          durationMs: 0
+        });
+
+        const res = await api.runCode.mutate(req);
+        if (active()) setLastRun(res);
+        return JSON.stringify(runResponseSchema.parse(res));
+      });
+
       room.registerTextStreamHandler(EVENT_TOPIC, async (reader, participant) => {
         const sender = room.remoteParticipants.get(participant.identity);
         if (sender?.kind !== ParticipantKind.AGENT) return;
         try { const event = eventSchema.parse(JSON.parse(await reader.readAll())); if (active()) receive(event); }
         catch { if (active()) setError("Received an invalid agent event."); }
       });
+
       const findAgent = (participant: Participant) => {
         if (active() && participant.kind === ParticipantKind.AGENT) {
           const ready = participant.attributes["assignment.ready"] === "true";
@@ -62,12 +112,23 @@ export default function Workspace() {
           setStatus(ready ? "Connected" : "Agent starting");
         }
       };
+
       room.on(RoomEvent.ParticipantConnected, findAgent);
       room.on(RoomEvent.ParticipantAttributesChanged, (_changed, participant) => findAgent(participant));
-      room.on(RoomEvent.ParticipantDisconnected, participant => { if (active() && participant.kind === ParticipantKind.AGENT) { setAgentIdentity(""); setStatus("Agent disconnected"); } });
+      room.on(RoomEvent.ParticipantDisconnected, participant => {
+        if (active() && participant.kind === ParticipantKind.AGENT) {
+          setAgentIdentity(""); setStatus("Agent disconnected");
+          editorRef.current?.highlightRange(undefined, undefined, undefined, true);
+        }
+      });
       room.on(RoomEvent.Reconnecting, () => { if (active()) setStatus("Reconnecting"); });
       room.on(RoomEvent.Reconnected, () => { if (active()) { setStatus("Connected"); room.remoteParticipants.forEach(findAgent); } });
-      room.on(RoomEvent.Disconnected, () => { if (active()) { roomRef.current = null; setStatus("Disconnected"); setAgentIdentity(""); setMic(false); setBusy(false); } });
+      room.on(RoomEvent.Disconnected, () => {
+        if (active()) {
+          roomRef.current = null; setStatus("Disconnected"); setAgentIdentity(""); setMic(false); setBusy(false);
+          editorRef.current?.highlightRange(undefined, undefined, undefined, true);
+        }
+      });
       room.on(RoomEvent.TrackSubscribed, track => {
         if (active() && track.kind === Track.Kind.Audio) audioHost.current?.appendChild(track.attach());
       });
@@ -87,6 +148,7 @@ export default function Workspace() {
     generation.current++;
     const room = roomRef.current; roomRef.current = null;
     setAgentIdentity(""); setStatus("Disconnected"); setMic(false); setBusy(false); setSending(false);
+    editorRef.current?.highlightRange(undefined, undefined, undefined, true);
     await room?.disconnect();
     audioHost.current?.replaceChildren();
   }
@@ -108,16 +170,96 @@ export default function Workspace() {
     catch { setError("Microphone access failed. Check browser permissions."); }
   }
 
-  return <main>
+  return <main suppressHydrationWarning>
     <header><a className="brand" href="/">sv<span>i</span>am<span className="brand-dot">.</span></a><span className="eyebrow">ENGINEERING TAKE-HOME</span><span className="local">● LOCAL WORKSPACE</span></header>
     <section className="intro"><div><p className="eyebrow">01 / THE STARTER</p><h1>Make the conversation<br /><em>interactive.</em></h1><p className="description">This take-home starter has a voice agent that can read your code. Build the three actions below.</p></div><div className="requirements"><span>YOUR THREE FEATURES</span><p>01 <strong>Highlight while speaking</strong></p><p>02 <strong>Edit code directly</strong></p><p>03 <strong>Run and explain</strong></p></div></section>
     <section className="problem"><span className="eyebrow">SAMPLE PROBLEM</span><p>{QUESTION}</p></section>
-    <div className="workspace"><section className="panel"><div className="panel-head"><strong>solution.ts</strong><span>TypeScript · revision {revision}</span></div><Editor initialCode={STARTER_CODE} onChange={code => { documentRef.current = { ...documentRef.current, code, revision: documentRef.current.revision + 1 }; setRevision(documentRef.current.revision); }} /><div className="panel-foot">Build speech-aligned highlights, direct code changes, and execution. This starter only reads editor content.</div></section>
-      <section className="panel conversation"><div className="panel-head"><strong>Agent conversation</strong><span role="status">{status}</span></div><div className="controls"><button disabled={busy || !!roomRef.current} onClick={() => void connect()}>{busy ? "Connecting…" : "Connect agent"}</button><button className="secondary" disabled={!roomRef.current && !busy} onClick={() => void disconnect()}>Disconnect</button>{mode === "voice" && <button className="secondary" disabled={!agentIdentity} onClick={() => void toggleMic()}>{mic ? "Mute microphone" : "Enable microphone"}</button>}</div>
-      <p className="mode">{mode === "voice" ? "Live voice · provider credentials required" : "Mock mode checks text + editor transport without paid API calls."}</p>
-      <div className="messages" aria-live="polite">{events.length === 0 && <div className="empty"><span>↗</span><h2>Start with a question.</h2><p>Connect the local agent, then ask about your code. Each turn requests a fresh editor snapshot.</p></div>}{events.map(event => event.kind === "context" ? null : <article className={`message ${event.kind === "error" ? "failure" : event.role}`} key={event.id}><label>{event.kind === "error" ? "Connection issue" : event.role === "user" ? "You" : "Agent"}</label><p>{event.text}</p></article>)}</div>
-      <form className="composer" onSubmit={e => { e.preventDefault(); void send(); }}><input aria-label="Message the agent" placeholder="Ask about your code…" value={text} maxLength={2000} onChange={e => setText(e.target.value)} /><button disabled={!agentIdentity || !text.trim() || sending}>{sending ? "Sending…" : "Send ↗"}</button></form>{error && <p className="error" role="alert">{error}</p>}</section></div>
-    <details className="context"><summary>Editor context used by the agent {snapshot ? `· revision ${snapshot.revision}${snapshot.revision !== revision ? " · editor has changed since capture" : ""}` : "· no turn yet"}</summary>{snapshot && <><p>Captured {new Date(snapshot.capturedAt).toLocaleTimeString()}. This copy belongs to that turn.</p><pre>{snapshot.code}</pre></>}</details>
-    <footer>Build locally. Explain your decisions. Submit a PR in your private assignment repository.</footer><div ref={audioHost} />
+    <div className="workspace">
+      <section className="panel">
+        <div className="panel-head"><strong>solution.ts</strong><span>TypeScript · revision {revision}</span></div>
+        <Editor ref={editorRef} initialCode={STARTER_CODE} onChange={code => { documentRef.current = { ...documentRef.current, code, revision: documentRef.current.revision + 1 }; setRevision(documentRef.current.revision); }} />
+        <div className="panel-foot">Speech-aligned highlights, direct code changes, and isolated execution are active.</div>
+        {lastRun && (
+          <div className="execution-panel" style={{ padding: "12px 14px", background: "#1e1e1e", color: "#e0e0e0", borderTop: "1px solid #333", fontSize: "13px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+              <span style={{ fontWeight: 600, color: lastRun.status === "success" ? "#4ade80" : lastRun.status === "timeout" ? "#facc15" : "#f87171" }}>
+                ● Execution {lastRun.status.toUpperCase()} (rev {lastRun.revision})
+              </span>
+              <span style={{ fontSize: "11px", color: "#888" }}>{lastRun.durationMs}ms</span>
+            </div>
+            <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontFamily: "var(--mono)", fontSize: "12px", background: "#111", padding: "8px", borderRadius: "4px" }}>
+              {lastRun.output || lastRun.error || "(No output)"}
+            </pre>
+          </div>
+        )}
+      </section>
+      <section className="panel conversation">
+        <div className="panel-head"><strong>Agent conversation</strong><span role="status">{status}</span></div>
+        <div className="controls">
+          <button disabled={busy || !!roomRef.current} onClick={() => void connect()}>{busy ? "Connecting…" : "Connect agent"}</button>
+          <button className="secondary" disabled={!roomRef.current && !busy} onClick={() => void disconnect()}>Disconnect</button>
+          {mode === "voice" && <button className="secondary" disabled={!agentIdentity} onClick={() => void toggleMic()}>{mic ? "Mute microphone" : "Enable microphone"}</button>}
+        </div>
+        <p className="mode">{mode === "voice" ? "Live voice · provider credentials required" : "Mock mode checks text + editor transport without paid API calls."}</p>
+        <div className="messages" aria-live="polite">
+          {events.length === 0 && <div className="empty"><span>↗</span><h2>Start with a question.</h2><p>Connect the local agent, then ask about your code. Each turn requests a fresh editor snapshot.</p></div>}
+          {events.map(event => {
+            if (event.kind === "context") return null;
+            if (event.kind === "transcript") {
+              return (
+                <article className={`message ${event.role}`} key={event.id}>
+                  <label>{event.role === "user" ? "You" : "Agent"}</label>
+                  <p>{event.text}</p>
+                </article>
+              );
+            }
+            if (event.kind === "error") {
+              return (
+                <article className="message failure" key={event.id}>
+                  <label>Connection issue</label>
+                  <p>{event.text}</p>
+                </article>
+              );
+            }
+            if (event.kind === "highlight") {
+              return (
+                <article className="message agent" key={event.id}>
+                  <label>Highlight Action</label>
+                  <p>{event.text || `Highlighted lines ${event.lineStart || 1}-${event.lineEnd || 1}`}</p>
+                </article>
+              );
+            }
+            if (event.kind === "edit") {
+              return (
+                <article className={`message ${event.success ? "agent" : "failure"}`} key={event.id}>
+                  <label>Direct Edit Action</label>
+                  <p>{event.text}</p>
+                </article>
+              );
+            }
+            if (event.kind === "run") {
+              return (
+                <article className={`message ${event.status === "success" ? "agent" : "failure"}`} key={event.id}>
+                  <label>Execution Action (rev {event.revision})</label>
+                  <p>{event.output}</p>
+                </article>
+              );
+            }
+            return null;
+          })}
+        </div>
+        <form className="composer" onSubmit={e => { e.preventDefault(); void send(); }}>
+          <input aria-label="Message the agent" placeholder="Ask about your code…" value={text} maxLength={2000} onChange={e => setText(e.target.value)} />
+          <button disabled={!agentIdentity || !text.trim() || sending}>{sending ? "Sending…" : "Send ↗"}</button>
+        </form>
+        {error && <p className="error" role="alert">{error}</p>}
+      </section>
+    </div>
+    <details className="context">
+      <summary>Editor context used by the agent {snapshot ? `· revision ${snapshot.revision}${snapshot.revision !== revision ? " · editor has changed since capture" : ""}` : "· no turn yet"}</summary>
+      {snapshot && <><p>Captured {new Date(snapshot.capturedAt).toLocaleTimeString()}. This copy belongs to that turn.</p><pre>{snapshot.code}</pre></>}
+    </details>
+    <footer>Build locally. Explain your decisions. Submit a PR in your private assignment repository.</footer>
+    <div ref={audioHost} />
   </main>;
 }

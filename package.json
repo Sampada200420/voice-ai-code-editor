@@ -11,7 +11,7 @@
     "agent": "tsx --env-file=.env.local agent/main.ts start",
     "agent:download": "tsx --env-file=.env.local agent/main.ts download-files",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/*.test.ts",
+    "test": "tsx --test tests/protocol.test.ts tests/provider-access.test.ts tests/actions.test.ts",
     "check": "npm run typecheck && npm test",
     "setup": "node scripts/setup.mjs",
     "doctor": "node scripts/doctor.mjs"
